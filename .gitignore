@@ -1,0 +1,24 @@
+# Gizli bilgiler
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# Benchmark ara çıktıları
+benchmarks/*.tmp
+
+# Yerel agent/araç dosyaları (.venv'e işaret eden linkler)
+.agents/
+.claude/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

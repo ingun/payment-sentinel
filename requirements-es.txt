@@ -1,0 +1,3 @@
+# Opsiyonel: Elasticsearch veri kaynağı (DATA_SOURCE=elasticsearch)
+-r requirements.txt
+elasticsearch>=8.15,<10

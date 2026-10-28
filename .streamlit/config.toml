@@ -1,0 +1,7 @@
+[server]
+# İlk çalıştırmadaki e-posta sorusunu gösterme
+showEmailPrompt = false
+
+[browser]
+# Kullanım istatistiği gönderme
+gatherUsageStats = false

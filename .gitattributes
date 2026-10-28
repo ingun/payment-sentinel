@@ -1,0 +1,3 @@
+# Satır sonları her platformda LF; sentetik veri dosyaları birebir aynı kalır
+* text=auto eol=lf
+*.png binary
