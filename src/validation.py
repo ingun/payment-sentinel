@@ -164,7 +164,8 @@ def find_unverified_numbers(text: str, allowed: set[float]) -> list[str]:
     unverified = []
     for match in _NUMBER_RE.findall(text):
         number = float(match.replace(",", "."))
-        if not any(abs(number - a) <= max(0.06, abs(a) * 0.01) for a in allowed):
+        # Regex işaretsiz yakalar; "-%37,5" değeri metinde "%37,5 düşüş" olarak yazılır, mutlak değerle karşılaştırılır
+        if not any(abs(number - abs(a)) <= max(0.06, abs(a) * 0.01) for a in allowed):
             unverified.append(match)
     return unverified
 

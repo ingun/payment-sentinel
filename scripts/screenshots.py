@@ -40,6 +40,15 @@ def shot(page: Page, name: str) -> None:
     print(f"kaydedildi: {path.name}", flush=True)
 
 
+def section(page: Page, text: str, name: str) -> None:
+    """Streamlit içeriği kendi kapsayıcısında kaydığı için full_page alt bölümlere inmez; bölüme kaydırıp çeker."""
+    page.get_by_text(text, exact=False).first.scroll_into_view_if_needed()
+    page.wait_for_timeout(800)
+    path = OUT / f"{name}.png"
+    page.screenshot(path=str(path))
+    print(f"kaydedildi: {path.name}", flush=True)
+
+
 def main(include_llm: bool) -> None:
     OUT.mkdir(exist_ok=True)
     with sync_playwright() as p:
@@ -53,6 +62,7 @@ def main(include_llm: bool) -> None:
             shot(page, "02_llm_agent_trace")
             tab(page, "📄 Rapor")
             shot(page, "03_llm_incident_report")
+            section(page, "Agent bulgu özeti", "03b_llm_agent_findings")
 
         investigate(page, "scenario=error_spike&provider=none")
         tab(page, "📈 Zaman serisi")

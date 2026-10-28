@@ -276,7 +276,7 @@ Rapor bölümleri:
 | **Pydantic v2** | Araç argümanı ve çıktı şemaları, rapor modeli |
 | **rank-bm25** | Kurulumu kolay, deterministik ve kaynaklı runbook araması |
 | **Streamlit** | Hızlı, okunaklı arayüz; canlı ilerleme (`st.status`) ve grafikler |
-| **pytest** | 71 otomatik test; LLM sahte nesneyle simüle edilir |
+| **pytest** | 72 otomatik test; LLM sahte nesneyle simüle edilir |
 | **Playwright** (yalnızca geliştirme) | Ekran görüntülerini çalışan uygulamadan otomatik almak için |
 
 ## 12. Kurulum ve çalıştırma
@@ -341,7 +341,7 @@ LLM erişilemezse uygulama otomatik olarak **sınırlı deterministik demo modun
 python -m pytest -q
 ```
 
-Son çalıştırma: **71 passed** (≈2 sn, gerçek LLM/API çağrısı yok).
+Son çalıştırma: **72 passed** (≈2 sn, gerçek LLM/API çağrısı yok).
 
 | Dosya | Kapsam |
 |---|---|
@@ -350,7 +350,7 @@ Son çalıştırma: **71 passed** (≈2 sn, gerçek LLM/API çağrısı yok).
 | `test_risk_engine.py` | Senaryo bazlı risk seviyeleri, skor aralığı, gerekçe toplamı, `INDETERMINATE`, güvenin skordan ayrı olması |
 | `test_tools.py` | Geçersiz zaman aralığı, bilinmeyen hata kodu/servis, boş log, sayfalama, sorgu limitleri, izinsiz araç, hata enjeksiyonu, incident eşleştirme |
 | `test_retriever.py` | Kaynaklı eşleşme, eşleşme yok, prompt injection ayıklama |
-| `test_validation.py` | Rapor-araç tutarlılığı, değiştirilmiş raporun yakalanması, desteksiz öneri, uydurma sayı ve kesin neden iddiasının reddi |
+| `test_validation.py` | Rapor-araç tutarlılığı, değiştirilmiş raporun yakalanması, desteksiz öneri, uydurma sayı ve kesin neden iddiasının reddi, düşüş olarak yazılan negatif değerlerin kabulü |
 | `test_agent.py` | Uçtan uca akış, retry, timeout, kalıcı hata, araç çağrısı sınırı, LLM hatasında yedek mod, LLM'in uydurduğu kapsam, LLM'in kapsam içi talebi reddedememesi, belirsiz talep, hafıza, kapsam dışı talep, summarizer (bulgu doğrulama, atlanma, hata durumu) |
 | `test_elasticsearch.py` | Query DSL üretimi ve yanıt ayrıştırma (sahte istemci) |
 
@@ -364,7 +364,30 @@ Ortam: Python 3.14.7 · pandas 3.1.0 · numpy 2.5.4 · Windows 11 · Intel64 Fam
 | 1.000.000 | 0.37 ms | 69.8 ms | 99.9 ms | 26.8 ms |
 | 3.000.000 | 0.66 ms | 134.5 ms | 333.2 ms | 58.3 ms |
 
-Bu ölçüm yalnızca sentetik (bellek içi) adaptör içindir. Elasticsearch ölçülmemiştir. Uçtan uca agent süresi LLM'e bağlıdır: bu makinede `qwen3.5:4b` ile bir inceleme 60–135 sn sürdü, deterministik modda < 0.1 sn.
+Bu ölçüm yalnızca sentetik (bellek içi) adaptör içindir. Elasticsearch ölçülmemiştir. Uçtan uca agent süresi LLM'e bağlıdır: bu makinede `qwen3.5:4b` ile bir inceleme 75–100 sn sürdü, deterministik modda < 0.1 sn.
+
+**LLM agent değerlendirmesi** (`python -m scripts.llm_eval`, sonuçlar `benchmarks/llm_eval.md`):
+
+Birim testler LLM'i sahte nesneyle simüle eder; bu betik ise agent'ı **gerçek LLM ile** uçtan uca çalıştırır. 4 senaryo × 3 farklı talep ifadesi ("…başarısızlıklarını araştır, karşılaştır ve raporla", "…hatalarını araştır ve karşılaştır", belirsiz "bir sorun var gibi"). Beklenen risk seviyesi, aynı talebin deterministik moddaki sonucudur.
+
+Ortam: `ollama/qwen3.5:4b`, Python 3.14.7, Windows 11.
+
+| Ölçüt | Sonuç |
+|---|---|
+| Doğru risk seviyesi | **12/12** |
+| Zorunlu kanıtlar tamamlandı | **12/12** |
+| LLM akışı yedek moda düşmeden yönetti | **10/12** (2'sinde verifier eksik kanıtı deterministik olarak tamamladı) |
+| LLM bulgu özeti yazdı | **12/12** |
+| Kabul / reddedilen bulgu | **75 / 0** |
+| Talepte dayanağı olmayan kapsam (servis/kod) yakalandı | 4 çalıştırmada |
+| Kapsam dışı talep reddedildi ("Bana bir şiir yaz") | **3/3** |
+| Ortalama araç çağrısı / medyan süre | 7.1 / 87 sn |
+
+Değerlendirme iki hatayı ortaya çıkardı ve ikisi de düzeltildi:
+1. LLM bazı kapsam içi talepleri "kapsam dışı" ilan edebiliyordu. Artık talepte ödeme terimi geçiyorsa bu karar kural tabanlı ayrıştırıcıya bırakılıyor.
+2. Doğrulama negatif araç değerlerini (`volume_change_pct = -37.5`) reddediyordu. Bu yüzden "hacim %37,5 düştü" gibi doğru bulgular rapora girmiyordu. Artık mutlak değerle karşılaştırılıyor; uydurma sayılar hâlâ reddediliyor (`test_validation.py`).
+
+Son çalıştırmada reddedilen bulgu olmaması, doğrulamanın gevşek olduğu anlamına gelmez. Uydurma sayı ve kesin neden iddiası içeren bulguların reddedildiği birim testlerle ayrıca doğrulanır. 12 çalıştırma küçük bir örneklemdir; sonuçlar bu senaryolar için bir gösterge olarak okunmalıdır.
 
 ## 15. Güvenlik
 
@@ -396,7 +419,8 @@ Bütün görüntüler çalışan uygulamadan `python -m scripts.screenshots` ile
 
 | | |
 |---|---|
-| ![LLM agent izleri](screenshots/02_llm_agent_trace.png) **LLM modu: plan, araç seçimleri, verifier** | ![Rapor](screenshots/03_llm_incident_report.png) **Kanıta dayalı rapor** |
+| ![LLM agent izleri](screenshots/02_llm_agent_trace.png) **LLM modu: plan, araç seçimleri, verifier, summarizer** | ![Rapor](screenshots/03_llm_incident_report.png) **Kanıta dayalı rapor** |
+| ![Bulgu özeti](screenshots/03b_llm_agent_findings.png) **Gözlem / hipotez / kök neden ayrımı ve doğrulamadan geçen LLM bulgu özeti** | |
 | ![Zaman serisi](screenshots/04_error_spike_timeseries.png) **Hata oranı / p95 / hacim** | ![Paternler](screenshots/05_error_spike_patterns.png) **Açıklanabilir patern kuralları** |
 | ![Benzer olaylar](screenshots/06_error_spike_similar_incidents.png) **Geçmiş incident eşleşmesi** | ![Runbook](screenshots/07_error_spike_runbooks.png) **Kaynaklı runbook araması ve injection ayıklama** |
 | ![Gecikme](screenshots/08_latency_degradation_overview.png) **Gecikme senaryosu** | ![Servisler](screenshots/09_latency_services.png) **Servis karşılaştırması** |
@@ -432,7 +456,7 @@ payment-sentinel/
 │   ├── sample_logs.jsonl     # varsayılan örnek (error_spike)
 │   ├── incidents.json        # sentetik geçmiş olaylar
 │   └── runbooks/*.md
-├── tests/                    # 71 test
+├── tests/                    # 72 test
 ├── scripts/                  # benchmark.py, llm_eval.py, screenshots.py
 ├── benchmarks/               # results.md (performans), llm_eval.md (LLM değerlendirmesi)
 └── screenshots/

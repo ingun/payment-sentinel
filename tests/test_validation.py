@@ -71,6 +71,13 @@ def test_unverified_numbers_and_causal_claims_are_rejected(finished_state):
     assert len(rejected) == 2
 
 
+def test_negative_tool_values_written_as_decrease_are_accepted():
+    allowed = collect_allowed_numbers([{"status": "ok", "output": {"volume_change_pct": -37.5, "p95_change_pct": -5.7}}])
+    assert find_unverified_numbers("Dakika başı işlem hacmi %37,5 düşüş gösteriyor.", allowed) == []
+    assert find_unverified_numbers("P95 gecikme %5,7 iyileşti.", allowed) == []
+    assert find_unverified_numbers("Hacim %42 düştü.", allowed) == ["42"]
+
+
 def test_required_evidence_detects_missing_tools(finished_state):
     scope = finished_state["scope"]
     assert check_required_evidence(finished_state["results"], scope) == []
