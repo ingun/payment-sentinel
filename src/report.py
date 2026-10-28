@@ -225,7 +225,8 @@ def validate_agent_findings(findings: list[str], results: list[dict], scope: dic
 
 
 def build_report(*, scope: dict, results: list[dict], mode: str, data_source: str, assumptions: list[str],
-                 limitations: list[str], missing: list[str], validation_log: list[dict]) -> IncidentReport:
+                 limitations: list[str], missing: list[str], validation_log: list[dict],
+                 agent_findings: list[str] | None = None) -> IncidentReport:
     comparison = find_result(results, "compare_time_windows", scope)
     analysis = find_result(results, "analyze_error_patterns", scope)
     similar = find_result(results, "search_similar_incidents", scope)
@@ -236,7 +237,8 @@ def build_report(*, scope: dict, results: list[dict], mode: str, data_source: st
 
     risk = assess_risk(comparison, analysis, tool_failures=tool_failures, missing_evidence=missing)
     observations = build_observations(comparison, analysis, logs)
-    accepted, rejected = validate_agent_findings((report_call or {}).get("accepted_findings", []), results, scope)
+    findings = (report_call or {}).get("accepted_findings", []) + list(agent_findings or [])
+    accepted, rejected = validate_agent_findings(findings, results, scope)
 
     limitations = list(limitations)
     if rejected:

@@ -3,32 +3,38 @@
 import pytest
 from langchain_core.messages import AIMessage
 
-from src.agent import InvestigationAgent
+from src.agent import FindingsSummary, InvestigationAgent
 from src.config import MAX_TOOL_CALLS
 from tests.conftest import BASELINE, CURRENT, REQUEST
 
 
 class FakeStructured:
-    def __init__(self, scope: dict):
-        self.scope = scope
+    def __init__(self, response):
+        self.response = response
 
     def invoke(self, _prompt):
-        return {"in_scope": True, "window_minutes": None, "service": None, "error_code": None, "is_follow_up": False, **self.scope}
+        if isinstance(self.response, Exception):
+            raise self.response
+        return self.response
 
 
 class FakeLLM:
     """Önceden yazılmış yanıtları sırayla döner; Exception öğeleri fırlatılır."""
 
-    def __init__(self, script: list, scope: dict | None = None):
+    def __init__(self, script: list, scope: dict | None = None, findings: list[str] | Exception | None = None):
         self.script = list(script)
         self.scope = scope or {}
+        self.findings = findings if findings is not None else []
         self.calls = 0
 
     def bind_tools(self, _tools):
         return self
 
-    def with_structured_output(self, _schema):
-        return FakeStructured(self.scope)
+    def with_structured_output(self, schema):
+        if schema is FindingsSummary:
+            return FakeStructured(self.findings if isinstance(self.findings, Exception) else {"findings": self.findings})
+        return FakeStructured({"in_scope": True, "window_minutes": None, "service": None, "error_code": None,
+                               "is_follow_up": False, **self.scope})
 
     def invoke(self, messages):
         if isinstance(messages, str):  # planner
@@ -105,6 +111,49 @@ def test_llm_selects_tools_and_findings_are_validated(make_toolkit):
     assert any(t["kind"] == "decision" and "LLM araç seçti" in t["detail"] for t in state["trace"])
 
 
+EVIDENCE_ONLY = [  # gerçek küçük modelin davranışı: kanıtları toplar, generate_incident_report çağırmaz
+    call("compare_time_windows", WINDOWS, 1),
+    call("analyze_error_patterns", WINDOWS, 2),
+    call("search_similar_incidents", WINDOWS, 3),
+    call("search_runbooks", {"query": "PROVIDER_TIMEOUT provider-connector"}, 4),
+    AIMessage(content="Bitti."),
+]
+
+
+def test_summarizer_writes_findings_when_llm_skips_report_tool(make_toolkit):
+    findings = ["Hata oranı %2.01'den %14.67'ye çıktı.", "Yaklaşık 999.5 işlem etkilendi.",
+                "Kök neden doğrulandı: sağlayıcı arızası."]
+    llm = FakeLLM(EVIDENCE_ONLY, findings=findings)
+    state = InvestigationAgent(make_toolkit(), llm).run(REQUEST, thread_id="sum")
+    assert state["mode"] == "llm"
+    assert state["report"]["agent_findings"] == [findings[0]]
+    rejected = [v for v in state["report"]["validation"] if v["check"] == "Agent bulgusu reddedildi"]
+    assert len(rejected) == 2  # uydurma sayı + kesin neden iddiası
+    assert any(t["node"] == "summarizer" and t["kind"] == "decision" for t in state["trace"])
+
+
+def test_summarizer_replaces_deterministic_placeholder_finding(make_toolkit):
+    llm = FakeLLM([RuntimeError("model down")], findings=["Hata oranı %14.67 oldu."])
+    state = InvestigationAgent(make_toolkit(), llm).run(REQUEST, thread_id="ph")
+    assert state["mode"] == "deterministic"
+    assert "Hata oranı %14.67 oldu." in state["report"]["agent_findings"]
+
+
+def test_summarizer_skipped_when_report_tool_already_sent_findings(make_toolkit):
+    script = EVIDENCE_ONLY[:-1] + [call("generate_incident_report", {"findings": ["Hata oranı %14.67 oldu."]}, 5)]
+    llm = FakeLLM(script, findings=["Bu bulgu kullanılmamalı."])
+    state = InvestigationAgent(make_toolkit(), llm).run(REQUEST, thread_id="skip")
+    assert "Bu bulgu kullanılmamalı." not in state["report"]["agent_findings"]
+    assert not any(t["node"] == "summarizer" for t in state["trace"])
+
+
+def test_summarizer_failure_does_not_block_report(make_toolkit):
+    llm = FakeLLM(EVIDENCE_ONLY, findings=RuntimeError("model down"))
+    state = InvestigationAgent(make_toolkit(), llm).run(REQUEST, thread_id="sumf")
+    assert state["report"]["risk"]["level"] == "HIGH" and state["report"]["agent_findings"] == []
+    assert any(t["node"] == "summarizer" and t["kind"] == "llm_error" for t in state["trace"])
+
+
 def test_tool_call_limit_prevents_infinite_loop(make_toolkit):
     loop = [call("calculate_payment_metrics", {"start_time": CURRENT["start"], "end_time": CURRENT["end"]}, i) for i in range(40)]
     state = InvestigationAgent(make_toolkit(), FakeLLM(loop)).run(REQUEST, thread_id="loop")
@@ -156,4 +205,16 @@ def test_follow_up_uses_memory(make_toolkit):
 
 def test_off_topic_request_is_declined(make_toolkit):
     state = InvestigationAgent(make_toolkit()).run("Bana bir şiir yaz", thread_id="o")
+    assert state["report"] is None and "kapsamında" in state["message"]
+
+
+def test_llm_cannot_decline_in_scope_request(make_toolkit):
+    llm = FakeLLM([RuntimeError("stop")], scope={"in_scope": False})
+    state = InvestigationAgent(make_toolkit(), llm).run("Son 30 dakikadaki ödeme hatalarını araştır ve normal dönemle karşılaştır.", thread_id="s")
+    assert state["report"] is not None and not state["message"]
+
+
+def test_llm_off_topic_request_is_declined(make_toolkit):
+    llm = FakeLLM([], scope={"in_scope": False})
+    state = InvestigationAgent(make_toolkit(), llm).run("Bana bir şiir yaz", thread_id="o2")
     assert state["report"] is None and "kapsamında" in state["message"]

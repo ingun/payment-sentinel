@@ -71,7 +71,8 @@ flowchart LR
     I -->|araç çağrısı yok| V[verifier<br/>kanıt + veri yeterliliği]
     E -->|rapor aracı / sınır| V
     V -->|eksik kanıt, sınırlı tekrar| I
-    V --> R[reporter<br/>risk + rapor + doğrulama]
+    V --> S[summarizer<br/>LLM bulgu özeti<br/>yapılandırılmış çıktı]
+    S --> R[reporter<br/>risk + rapor + doğrulama]
     R --> O([Rapor, izler, hafıza])
 
     subgraph Araçlar
@@ -96,6 +97,7 @@ flowchart LR
 | **Çok adımlı akıl yürütme** | Investigator ⇄ executor döngüsü: her araç sonucu bir sonraki kararı belirler |
 | **Hafıza** | LangGraph `InMemorySaver` checkpointer + Streamlit oturum `thread_id`. "Şimdi sadece acquirer-gateway'e bak" gibi takip soruları önceki kapsamı kullanır |
 | **Öz-denetim** | `verifier` düğümü zorunlu kanıtları ve veri yeterliliğini kontrol eder, gerekirse baseline'ı genişletir veya eksik aracı yeniden çağırtır |
+| **Bulgu özeti** | LLM bulgularını `generate_incident_report` ile göndermezse `summarizer` düğümü yalnızca araç çıktılarından derlenen gerçekleri verip yapılandırılmış çıktıyla (`with_structured_output`) 3-6 bulgu ister. Bulgular rapora girmeden önce sayı ve neden iddiası açısından doğrulanır |
 | **Sınırlar** | `MAX_TOOL_CALLS=12`, `MAX_RETRIES=2`, araç başına 1 geçici hata tekrarı, araç timeout'u 10 sn, LangGraph `recursion_limit=40` |
 | **Graceful degradation** | LLM erişilemezse ya da adım ortasında hata verirse aynı araçlar deterministik planla çalışmaya devam eder; arayüz bunu açıkça gösterir |
 
@@ -106,7 +108,9 @@ flowchart LR
 - Plan yazmak.
 - Hangi aracın hangi sırayla çağrılacağına karar vermek.
 - Runbook sorgusunu oluşturmak.
-- Bulgu özeti yazmak.
+- Bulgu özeti yazmak (doğrulanmış gerçeklerden; uydurma sayı içeren bulgu reddedilir).
+
+LLM'in çıktısı hiçbir yerde kontrolsüz kullanılmaz. Talep yorumunda talepte dayanağı olmayan servis, hata kodu veya süre yok sayılır. Talepte ödeme terimi geçiyorsa LLM talebi kapsam dışı ilan edemez; küçük model bu alanda tutarsız davranabiliyor.
 
 **LLM'in görevi olmayanlar:**
 - Sayısal hesap yapmak.
@@ -272,7 +276,7 @@ Rapor bölümleri:
 | **Pydantic v2** | Araç argümanı ve çıktı şemaları, rapor modeli |
 | **rank-bm25** | Kurulumu kolay, deterministik ve kaynaklı runbook araması |
 | **Streamlit** | Hızlı, okunaklı arayüz; canlı ilerleme (`st.status`) ve grafikler |
-| **pytest** | 65 otomatik test; LLM sahte nesneyle simüle edilir |
+| **pytest** | 71 otomatik test; LLM sahte nesneyle simüle edilir |
 | **Playwright** (yalnızca geliştirme) | Ekran görüntülerini çalışan uygulamadan otomatik almak için |
 
 ## 12. Kurulum ve çalıştırma
@@ -337,7 +341,7 @@ LLM erişilemezse uygulama otomatik olarak **sınırlı deterministik demo modun
 python -m pytest -q
 ```
 
-Son çalıştırma: **65 passed** (≈2 sn, gerçek LLM/API çağrısı yok).
+Son çalıştırma: **71 passed** (≈2 sn, gerçek LLM/API çağrısı yok).
 
 | Dosya | Kapsam |
 |---|---|
@@ -347,7 +351,7 @@ Son çalıştırma: **65 passed** (≈2 sn, gerçek LLM/API çağrısı yok).
 | `test_tools.py` | Geçersiz zaman aralığı, bilinmeyen hata kodu/servis, boş log, sayfalama, sorgu limitleri, izinsiz araç, hata enjeksiyonu, incident eşleştirme |
 | `test_retriever.py` | Kaynaklı eşleşme, eşleşme yok, prompt injection ayıklama |
 | `test_validation.py` | Rapor-araç tutarlılığı, değiştirilmiş raporun yakalanması, desteksiz öneri, uydurma sayı ve kesin neden iddiasının reddi |
-| `test_agent.py` | Uçtan uca akış, retry, timeout, kalıcı hata, araç çağrısı sınırı, LLM hatasında yedek mod, LLM'in uydurduğu kapsam, belirsiz talep, hafıza, kapsam dışı talep |
+| `test_agent.py` | Uçtan uca akış, retry, timeout, kalıcı hata, araç çağrısı sınırı, LLM hatasında yedek mod, LLM'in uydurduğu kapsam, LLM'in kapsam içi talebi reddedememesi, belirsiz talep, hafıza, kapsam dışı talep, summarizer (bulgu doğrulama, atlanma, hata durumu) |
 | `test_elasticsearch.py` | Query DSL üretimi ve yanıt ayrıştırma (sahte istemci) |
 
 **Benchmark** (`python -m scripts.benchmark`, sonuçlar `benchmarks/results.md`):
@@ -380,7 +384,8 @@ Bu ölçüm yalnızca sentetik (bellek içi) adaptör içindir. Elasticsearch ö
 - Küçük yerel model (`qwen3.5:4b`) zaman zaman şunları yapabiliyor:
   - Talepte geçmeyen bir servis "uydurmak": yok sayılır.
   - Hatalı argüman göndermek: düzeltip tekrar dener.
-  - `generate_incident_report` çağırmadan bitirmek: rapor yine deterministik üretilir, ama LLM bulgu özeti boş kalır.
+  - `generate_incident_report` çağırmadan bitirmek: bu durumda bulgu özeti `summarizer` düğümünde ayrıca istenir.
+  - Tek bir talepte 60-120 sn sürmek (yerel CPU/GPU'ya bağlı).
 - Hafıza bellek içidir (`InMemorySaver`). Uygulama yeniden başlatılınca silinir.
 - Elasticsearch adaptörü canlı kümede test edilmedi. Sayfalama `from/size` ile yapılıyor; çok derin sayfalama için `search_after` gerekir.
 - Kök neden otomatik olarak doğrulanmaz; rapor bunu hiçbir zaman iddia etmez.
@@ -427,8 +432,8 @@ payment-sentinel/
 │   ├── sample_logs.jsonl     # varsayılan örnek (error_spike)
 │   ├── incidents.json        # sentetik geçmiş olaylar
 │   └── runbooks/*.md
-├── tests/                    # 65 test
-├── scripts/                  # benchmark.py, screenshots.py
-├── benchmarks/results.md
+├── tests/                    # 71 test
+├── scripts/                  # benchmark.py, llm_eval.py, screenshots.py
+├── benchmarks/               # results.md (performans), llm_eval.md (LLM değerlendirmesi)
 └── screenshots/
 ```
