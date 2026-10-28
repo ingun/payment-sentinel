@@ -280,7 +280,7 @@ Rapor bölümleri:
 **Gereksinimler:** Python 3.12+ (3.14.7 ile test edildi). LLM modu için opsiyonel olarak [Ollama](https://ollama.com) gerekir.
 
 ```bash
-git clone <repo-url> payment-sentinel
+git clone https://github.com/ingun/payment-sentinel.git
 cd payment-sentinel
 
 python -m venv .venv
