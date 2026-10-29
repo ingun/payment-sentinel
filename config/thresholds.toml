@@ -1,0 +1,14 @@
+# Payment Sentinel analitik eşikleri (sentetik demo için; üretim için kalibre edilmemiştir).
+# Yalnızca değiştirmek istediğiniz değerleri yazmanız yeterlidir; diğerleri src/analytics/thresholds.py
+# içindeki varsayılanlardan gelir. Farklı bir dosya için: THRESHOLDS_PATH=/yol/thresholds.toml
+
+[detection]
+min_samples_sufficient = 200
+min_samples_limited = 50
+technical_min_delta_pp = 1.0
+min_z = 3.0
+segment_alpha = 0.001
+
+[risk]
+high_threshold = 60
+medium_threshold = 30
