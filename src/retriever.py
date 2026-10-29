@@ -7,11 +7,11 @@ ve bölüm adını taşır. Doküman içeriği güvenilmeyen veri kabul edilir.
 
 import re
 from dataclasses import dataclass
-from pathlib import Path
 
 from rank_bm25 import BM25Okapi
 
-from src.config import RUNBOOK_DIR
+from src.repositories.base import RunbookRepository
+from src.repositories.knowledge import MarkdownRunbookRepository
 
 MIN_SCORE = 1.0
 MAX_CHUNK_CHARS = 700
@@ -86,13 +86,13 @@ def split_markdown(source: str, text: str) -> list[Chunk]:
 
 
 class RunbookRetriever:
-    def __init__(self, runbook_dir: Path = RUNBOOK_DIR, min_score: float = MIN_SCORE):
+    def __init__(self, repository: RunbookRepository | None = None, min_score: float = MIN_SCORE):
         self.min_score = min_score
         self.chunks: list[Chunk] = []
-        for path in sorted(runbook_dir.glob("*.md")):
-            self.chunks.extend(split_markdown(path.name, path.read_text(encoding="utf-8")))
+        for source, text in (repository or MarkdownRunbookRepository()).documents():
+            self.chunks.extend(split_markdown(source, text))
         if not self.chunks:
-            raise FileNotFoundError(f"Runbook bulunamadı: {runbook_dir}")
+            raise FileNotFoundError("Runbook bulunamadı.")
         # Başlık da aranabilir olsun diye bölüm adı metne eklenir
         self.bm25 = BM25Okapi([tokenize(f"{c.section} {c.text}") for c in self.chunks])
 

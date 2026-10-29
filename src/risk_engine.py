@@ -1,31 +1,38 @@
 """
-Açıklanabilir risk skoru ve ondan ayrı tutulan veri güven düzeyi.
+Deterministik etki ve risk değerlendirmesi (LLM'den bağımsız).
 
-- Risk skoru: anomalinin operasyonel etkisi (ne kadar ciddi?).
-- Güven düzeyi: bulguların dayandığı verinin yeterliliği (ne kadar emin olabiliriz?).
-Bu ikisi birbirine karıştırılmaz; yüksek risk düşük güvenle birlikte raporlanabilir.
+- Skor (0-100): tespit edilen sinyallerin operasyonel etkisine göre puan toplamı. Formül ve eşikler
+  src/analytics/thresholds.py içindeki RiskThresholds ile yapılandırılır.
+- Kanıt kalitesi seviyeyi sınırlar: `limited` → en fazla MEDIUM, `insufficient` → INDETERMINATE.
+- Güven düzeyi ayrıca raporlanır (araç hataları ve eksik kanıt düşürür); skorla karıştırılmaz.
+- Anomali skoru parasal kayıp değildir. Veride tutar alanı olmadığı için parasal etki hesaplanmaz.
 
-UYARI: Ağırlıklar ve eşikler demo amaçlıdır; üretim ortamı için kalibre edilmemiştir.
+LLM skoru göremez, değiştiremez; yalnızca rapordaki gerekçeyi açıklayabilir.
 """
 
-from src.config import MIN_SAMPLES
-from src.schemas import RiskAssessment, RiskReason
+from src.analytics.quality import weakest
+from src.analytics.thresholds import RiskThresholds, default_thresholds
+from src.policy import detected
+from src.schemas import RiskAssessment, RiskFactor
+from src.validation import find_all, find_baseline, find_coverage, find_result
 
-ERROR_DELTA_RULES = [(5.0, 25), (2.0, 12)]
-ABS_ERROR_RATE_THRESHOLD, ABS_ERROR_RATE_POINTS = 0.10, 10
-EXCESS_FAILED_RULES = [(100, 20), (25, 10)]
-VOLUME_DROP_RULES = [(50.0, 30), (30.0, 20)]
-LATENCY_RULES = [(200.0, 20), (50.0, 10)]
-DURATION_RULES = [(20, 10), (10, 5)]
-AFFECTED_SERVICE_RULES = [(2, 10), (1, 5)]
-
-HIGH_THRESHOLD = 60
-MEDIUM_THRESHOLD = 30
-HIGH_CONFIDENCE_SAMPLES = 300
-HIGH_CONFIDENCE_BUCKETS = 6
-
+MONETARY_NOTE = ("Belirlenemedi: veri setinde güvenilir tutar alanı ve iş kuralı yok. Etki yalnızca işlem sayısı "
+                 "olarak raporlanır; anomali skoru parasal kayıp değildir.")
 NOTE = "Risk ağırlıkları ve eşikleri demo amaçlıdır; üretim için kalibre edilmemiştir."
 CONFIDENCE_LEVELS = ["LOW", "MEDIUM", "HIGH"]
+
+
+def formula(rt: RiskThresholds) -> str:
+    def fmt(rules):
+        return " / ".join(f"≥{t}: +{p}" for t, p in rules)
+
+    return (f"skor = min(100, Σ puan). Teknik hata Δ puan [{fmt(rt.technical_delta_rules)}]; red Δ puan "
+            f"[{fmt(rt.decline_delta_rules)}]; etkilenen işlem [{fmt(rt.affected_tx_rules)}]; p95 değişim % "
+            f"[{fmt(rt.latency_rules)}]; süre dk [{fmt(rt.duration_rules)}]; teknik reversal [{fmt(rt.technical_reversal_rules)}]; "
+            f"mutabakat riski göstergesi [{', '.join(f'{k}: +{v}' for k, v in rt.reconciliation_points.items())}]; "
+            f"hacim düşüşü % [{fmt(rt.volume_drop_rules)}]; izole segment içi teknik hata oranı [{fmt(rt.segment_rate_rules)}]; "
+            f"izole kapsam +{rt.isolated_scope_points}, yaygın kapsam +{rt.broad_scope_points}. "
+            f"Seviye: ≥{rt.high_threshold} HIGH, ≥{rt.medium_threshold} MEDIUM, aksi LOW.")
 
 
 def _points(value: float | None, rules: list[tuple[float, int]]) -> tuple[int, float | None]:
@@ -37,90 +44,133 @@ def _points(value: float | None, rules: list[tuple[float, int]]) -> tuple[int, f
     return 0, None
 
 
-def level_for(score: int) -> str:
-    if score >= HIGH_THRESHOLD:
+def level_for(score: int, rt: RiskThresholds) -> str:
+    if score >= rt.high_threshold:
         return "HIGH"
-    if score >= MEDIUM_THRESHOLD:
+    if score >= rt.medium_threshold:
         return "MEDIUM"
     return "LOW"
 
 
-def assess_confidence(comparison: dict, analysis: dict | None, tool_failures: int, missing_evidence: list[str]) -> tuple[str, list[str]]:
-    cur, base = comparison["current"], comparison["baseline"]
-    reasons = []
-    buckets = len(analysis["buckets"]) if analysis else 0
-    if cur["total_attempts"] >= HIGH_CONFIDENCE_SAMPLES and base["total_attempts"] >= HIGH_CONFIDENCE_SAMPLES and buckets >= HIGH_CONFIDENCE_BUCKETS:
-        level = 2
-        reasons.append(f"Örneklem yeterli (güncel {cur['total_attempts']}, baseline {base['total_attempts']}, {buckets} zaman dilimi).")
-    else:
-        level = 1
-        reasons.append(f"Örneklem sınırlı (güncel {cur['total_attempts']}, baseline {base['total_attempts']}, {buckets} zaman dilimi).")
-    if tool_failures:
-        level -= 1
-        reasons.append(f"{tool_failures} araç çağrısı başarısız oldu.")
-    if missing_evidence:
-        level -= 1
-        reasons.append(f"Eksik kanıt: {', '.join(missing_evidence)}.")
-    if analysis and any(p["insufficient_data"] for p in analysis["patterns"]):
-        level -= 1
-        reasons.append("Bazı paternler veri yetersizliği nedeniyle değerlendirilemedi.")
-    return CONFIDENCE_LEVELS[max(0, level)], reasons
+def affected_scope(results: list[dict]) -> tuple[dict, str | None]:
+    """İzole segmentler ve kapsam tipi ('isolated' | 'broad' | None)."""
+    scope: dict[str, str] = {}
+    broad = False
+    for out in find_all(results, "breakdown_by_dimension") + [o["isolation"] for o in find_all(results, "analyze_response_codes") if o.get("isolation")]:
+        if out["isolated"]:
+            scope.setdefault(out["dimension"], out["isolated_segment"])
+        elif len(out.get("significant", [])) > 1:
+            broad = True
+    for out in find_all(results, "compare_service_versions"):
+        if out["detection"]["detected"]:
+            scope.setdefault("service_version", f"{out['service']} {out['detection']['subject']}")
+    kind = "isolated" if scope else ("broad" if broad else None)
+    return scope, kind
 
 
-def assess_risk(comparison: dict | None, analysis: dict | None, tool_failures: int = 0, missing_evidence: list[str] | None = None) -> RiskAssessment:
-    missing_evidence = missing_evidence or []
-    if comparison is None:
-        return RiskAssessment(level="INDETERMINATE", score=None, reasons=[], confidence="LOW",
-                              confidence_reasons=["Karşılaştırma verisi yok."], note=NOTE)
-    cur, base = comparison["current"], comparison["baseline"]
-    if cur["total_attempts"] < MIN_SAMPLES or base["total_attempts"] < MIN_SAMPLES:
-        return RiskAssessment(
-            level="INDETERMINATE", score=None, reasons=[], confidence="LOW",
-            confidence_reasons=[f"Güvenilir sınıf için her pencerede en az {MIN_SAMPLES} işlem gerekir "
-                                f"(güncel {cur['total_attempts']}, baseline {base['total_attempts']})."],
-            note=NOTE,
-        )
+def assess_risk(results: list[dict], scope: dict, tool_failures: int = 0, missing: list[str] | None = None,
+                rt: RiskThresholds | None = None) -> RiskAssessment:
+    rt = rt or default_thresholds().risk
+    missing = missing or []
 
-    detected = {p["type"]: p for p in (analysis or {}).get("patterns", []) if p["detected"]}
-    reasons: list[RiskReason] = []
+    baseline = find_baseline(results, scope)
+    coverage = find_coverage(results, scope)
+    base_kw = {"formula": formula(rt), "note": NOTE, "monetary_impact": MONETARY_NOTE}
+    if baseline is None:
+        return RiskAssessment(severity="INDETERMINATE", score=None, factors=[], affected_scope={}, affected_transactions=0,
+                              evidence_quality="insufficient", evidence_limitations=["Baseline karşılaştırması yok."],
+                              confidence="LOW", confidence_reasons=["Karşılaştırma verisi alınamadı."], **base_kw)
+
+    tech = next(d for d in baseline["detections"] if d["detector"] == "TECHNICAL_FAILURE_SPIKE")
+    quality = weakest(tech["evidence_quality"], coverage["evidence_quality"] if coverage else tech["evidence_quality"])
+    limitations = list(dict.fromkeys(tech["limitations"] + (coverage["issues"] if coverage else [])))
+    found = detected(results)
+    names = {d["detector"] for d in found}
+    seg_scope, scope_kind = affected_scope(results)
+
+    if quality == "insufficient":
+        return RiskAssessment(severity="INDETERMINATE", score=None, factors=[], affected_scope=seg_scope,
+                              affected_transactions=0, evidence_quality=quality,
+                              evidence_limitations=limitations or ["Kanıt yetersiz."], confidence="LOW",
+                              confidence_reasons=["Örneklem veya veri kapsamı güçlü bir sonuç için yetersiz."], **base_kw)
+
+    factors: list[RiskFactor] = []
 
     def add(factor: str, value: str, points: int, explanation: str) -> None:
         if points:
-            reasons.append(RiskReason(factor=factor, value=value, points=points, explanation=explanation))
+            factors.append(RiskFactor(factor=factor, value=value, points=points, explanation=explanation))
 
-    if "ERROR_RATE_SPIKE" in detected or "SERVICE_ERROR_SPIKE" in detected:
-        delta = comparison["error_rate_delta_pp"]
-        pts, thr = _points(delta, ERROR_DELTA_RULES)
-        add("Hata oranı (baseline farkı)", f"{delta:+.2f} puan", pts, f"Baseline'a göre artış {thr} puan eşiğini aşıyor.")
-        if cur["error_rate"] is not None and cur["error_rate"] >= ABS_ERROR_RATE_THRESHOLD:
-            add("Mutlak hata oranı", f"%{cur['error_rate'] * 100:.2f}", ABS_ERROR_RATE_POINTS,
-                f"Hata oranı %{ABS_ERROR_RATE_THRESHOLD * 100:.0f} üzerinde.")
-        excess = comparison["excess_failed"]
-        pts, thr = _points(excess, EXCESS_FAILED_RULES)
-        add("Etkilenen işlem hacmi", f"~{excess} fazladan başarısız işlem", pts,
-            f"Baseline oranına göre beklenenden en az {thr} fazla başarısız işlem.")
+    deltas, excess = baseline["deltas"], baseline["excess"]
+    affected = 0
+    if "TECHNICAL_FAILURE_SPIKE" in names or "TIMEOUT_RATE_SPIKE" in names:
+        pts, thr = _points(deltas["technical_pp"], rt.technical_delta_rules)
+        add("Teknik hata oranı farkı", f"{deltas['technical_pp']:+.2f} puan", pts, f"Baseline'a göre artış {thr} puan eşiğini aşıyor.")
+        affected += excess["technical"]
+    if "DECLINE_RATE_SPIKE" in names:
+        pts, thr = _points(deltas["decline_pp"], rt.decline_delta_rules)
+        add("Red oranı farkı", f"{deltas['decline_pp']:+.2f} puan", pts, f"Red oranı baseline'a göre {thr} puandan fazla arttı.")
+        affected += excess["declined"]
+    # İnceleme kapsamıyla eşleşen reversal analizi tercih edilir; yalnızca daha dar (takip) analiz varsa o kullanılır.
+    # Böylece skor, agent'ların çalışma sırasına bağlı olmaz.
+    reversal = next((o for o in reversed(find_all(results, "analyze_reversals"))
+                     if o.get("filters", {}) == scope.get("filters", {})), None) or find_result(results, "analyze_reversals")
+    if reversal and reversal["detection"]["detected"]:
+        technical = reversal["detection"]["extra"]["technical"]
+        pts, thr = _points(technical, rt.technical_reversal_rules)
+        add("Teknik reversal", f"{technical} adet", pts, f"Onay sonrası otomatik veya orphan reversal sayısı {thr} eşiğini aşıyor.")
+        affected += technical
+    if reversal:
+        rr = reversal["reconciliation_risk"]
+        add("Mutabakat riski göstergesi", rr["level"], rt.reconciliation_points.get(rr["level"], 0),
+            "Onay sonrası otomatik reversal, orphan reversal ve reversal'sız timeout sayılarından türetilir.")
+    volume = next((d for d in found if d["detector"] == "VOLUME_ANOMALY" and (d["rel_deviation_pct"] or 0) < 0), None)
+    if volume:
+        drop = -volume["rel_deviation_pct"]
+        pts, thr = _points(drop, rt.volume_drop_rules)
+        add("Hacim düşüşü", f"-%{drop:.1f}", pts, f"Hacim referansa göre %{thr:.0f}'den fazla düştü.")
+        affected += volume["extra"].get("missing_transactions", 0)  # işlenmeyen işlem tahmini (referansa göre)
+    if affected:
+        pts, thr = _points(affected, rt.affected_tx_rules)
+        add("Etkilenen işlem", f"~{affected} işlem", pts,
+            f"Baseline'a göre beklenenden en az {thr} fazla hatalı, reddedilmiş, geri alınmış veya işlenmemiş işlem.")
+    if "LATENCY_INCREASE" in names:
+        change = max((d["statistic"] or 0) for d in found if d["detector"] == "LATENCY_INCREASE")
+        pts, thr = _points(change, rt.latency_rules)
+        add("Gecikme artışı", f"p95 +%{change:.1f}", pts, f"p95 işlem süresi %{thr:.0f}'den fazla arttı.")
+    durations = [t["duration_min"] for t in baseline.get("timeline", {}).values()]
+    if found and durations:
+        duration = max(durations)
+        pts, thr = _points(duration, rt.duration_rules)
+        add("Süre", f"{duration} dk", pts, f"Anomali en az {thr} dakikadır sürüyor.")
+    segment_rates = [(o["isolated_segment"], o["segments"][0]["rate"]) for o in find_all(results, "breakdown_by_dimension")
+                     if o["isolated"] and o["metric"] == "technical_rate" and o["segments"] and o["segments"][0]["segment"] == o["isolated_segment"]]
+    if segment_rates:
+        segment, rate = max(segment_rates, key=lambda x: x[1] or 0)
+        pts, thr = _points(rate, rt.segment_rate_rules)
+        add("Segment içi teknik hata oranı", f"{segment}: %{(rate or 0) * 100:.2f}", pts,
+            f"Etkilenen segmentte işlemlerin en az %{(thr or 0) * 100:.0f}'i teknik hatayla sonuçlanıyor.")
+    if found and scope_kind == "isolated":
+        add("Etkilenen kapsam", ", ".join(f"{k}={v}" for k, v in seg_scope.items()), rt.isolated_scope_points,
+            "Etki belirli bir segmentle sınırlı.")
+    elif found and scope_kind == "broad":
+        add("Etkilenen kapsam", "birden fazla segment", rt.broad_scope_points, "Etki birden fazla segmente yayılmış.")
 
-    if "VOLUME_ANOMALY" in detected and (comparison["volume_change_pct"] or 0) < 0:
-        drop = -comparison["volume_change_pct"]
-        pts, thr = _points(drop, VOLUME_DROP_RULES)
-        add("İşlem hacmi düşüşü", f"-%{drop:.1f}", pts, f"Dakika başı hacim %{thr:.0f}'den fazla düştü; kayıp ödeme riski.")
+    score = min(100, sum(f.points for f in factors))
+    severity = level_for(score, rt)
+    capped = None
+    if quality == "limited" and severity == "HIGH":
+        severity, capped = "MEDIUM", "Kanıt kalitesi sınırlı olduğu için seviye MEDIUM ile sınırlandı."
 
-    latency_changes = [p["statistic"] for p in (analysis or {}).get("patterns", []) if p["type"] == "SERVICE_LATENCY_INCREASE" and p["detected"]]
-    if latency_changes:
-        top = max(latency_changes)
-        pts, thr = _points(top, LATENCY_RULES)
-        add("Gecikme artışı", f"+%{top:.1f} (servis p95)", pts, f"Servis p95 gecikmesi %{thr:.0f}'den fazla arttı.")
-
-    if detected and analysis:
-        duration = analysis["duration_min"]
-        pts, thr = _points(duration, DURATION_RULES)
-        suffix = " ve devam ediyor" if analysis["ongoing"] else ""
-        add("Anomali süresi", f"{duration} dk{suffix}", pts, f"Anomali en az {thr} dakikadır sürüyor.")
-        affected = len(analysis["affected_services"])
-        pts, thr = _points(affected, AFFECTED_SERVICE_RULES)
-        add("Etkilenen servis sayısı", str(affected), pts, f"{affected} serviste servis bazlı anomali var.")
-
-    score = min(100, sum(r.points for r in reasons))
-    confidence, confidence_reasons = assess_confidence(comparison, analysis, tool_failures, missing_evidence)
-    return RiskAssessment(level=level_for(score), score=score, reasons=reasons, confidence=confidence,
-                          confidence_reasons=confidence_reasons, note=NOTE)
+    conf = 2 if quality == "sufficient" else 1
+    reasons = [f"Kanıt kalitesi: {quality}."]
+    if tool_failures:
+        conf -= 1
+        reasons.append(f"{tool_failures} araç çağrısı başarısız oldu.")
+    if missing:
+        conf -= 1
+        reasons.append(f"Eksik kanıt: {', '.join(missing)}.")
+    return RiskAssessment(
+        severity=severity, score=score, factors=factors, affected_scope=seg_scope, affected_transactions=affected,
+        evidence_quality=quality, evidence_limitations=limitations, confidence=CONFIDENCE_LEVELS[max(0, conf)],
+        confidence_reasons=reasons, capped=capped, **base_kw,
+    )

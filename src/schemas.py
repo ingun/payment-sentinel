@@ -1,18 +1,23 @@
 """
-Araç girdi/çıktıları ve rapor için Pydantic şemaları.
+Araç girdi/çıktıları, risk ve rapor için Pydantic şemaları.
+Girdi şemaları LLM'e tool şeması olarak verilir; çıktı şemaları executor'da doğrulanır.
 """
 
 import json
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-# ---------- Araç argümanları (LLM'e tool şeması olarak verilir) ----------
+from src.domain import CHANNELS, DIMENSIONS, PAYMENT_METHODS, SERVICES, TRANSACTION_STATUSES, TRANSACTION_TYPES
+
+ID_PATTERN = r"^[A-Za-z0-9_.\-]{1,64}$"
+
+# ---------- Araç argümanları ----------
 
 
 class TimeWindow(BaseModel):
-    start: str = Field(description="ISO-8601 başlangıç, ör. 2026-10-27T11:30:00Z")
-    end: str = Field(description="ISO-8601 bitiş, ör. 2026-10-27T12:00:00Z")
+    start: str = Field(description="ISO-8601 başlangıç (UTC), ör. 2026-10-27T11:00:00Z")
+    end: str = Field(description="ISO-8601 bitiş (UTC), ör. 2026-10-27T12:00:00Z")
 
 
 def _coerce_window(value: object) -> object:
@@ -23,10 +28,57 @@ def _coerce_window(value: object) -> object:
     return value
 
 
-class _WindowPairArgs(BaseModel):
+class ScopeFilters(BaseModel):
+    """Kapsam filtreleri; yalnızca izinli alanlar ve güvenli değerler kabul edilir."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    bank_id: str | None = Field(default=None, pattern=ID_PATTERN, description="Banka, ör. BANK_B")
+    merchant_id: str | None = Field(default=None, pattern=ID_PATTERN, description="Üye işyeri, ör. M-007")
+    channel: Literal[tuple(CHANNELS)] | None = Field(default=None, description="POS veya ECOM")  # type: ignore[valid-type]
+    payment_method: Literal[tuple(PAYMENT_METHODS)] | None = None  # type: ignore[valid-type]
+    service_name: Literal[tuple(SERVICES)] | None = None  # type: ignore[valid-type]
+    service_version: str | None = Field(default=None, pattern=ID_PATTERN)
+    transaction_type: Literal[tuple(TRANSACTION_TYPES)] | None = None  # type: ignore[valid-type]
+
+    def active(self) -> dict[str, str]:
+        return {k: v for k, v in self.model_dump().items() if v is not None}
+
+
+def _coerce_filters(value: object) -> object:
+    if value in (None, "", "null", "{}"):
+        return {}
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return value
+    if isinstance(value, dict):
+        return {k: v for k, v in value.items() if v not in (None, "", "all", "tümü")}
+    return value
+
+
+class _FilterArgs(BaseModel):
+    filters: ScopeFilters = Field(default_factory=ScopeFilters, description="Kapsam filtreleri (opsiyonel)")
+
+    @field_validator("filters", mode="before")
+    @classmethod
+    def _parse_filters(cls, value: object) -> object:
+        return _coerce_filters(value)
+
+
+class WindowArgs(_FilterArgs):
+    window: TimeWindow = Field(description="İncelenen dönem")
+
+    @field_validator("window", mode="before")
+    @classmethod
+    def _parse_window(cls, value: object) -> object:
+        return _coerce_window(value)
+
+
+class BaselineArgs(_FilterArgs):
     current_window: TimeWindow = Field(description="İncelenen dönem")
     baseline_window: TimeWindow = Field(description="Karşılaştırma (normal) dönemi")
-    service: str | None = Field(default=None, description="Servis adı filtresi (opsiyonel)")
 
     @field_validator("current_window", "baseline_window", mode="before")
     @classmethod
@@ -34,40 +86,37 @@ class _WindowPairArgs(BaseModel):
         return _coerce_window(value)
 
 
-class SearchLogsArgs(BaseModel):
-    start_time: str = Field(description="ISO-8601 başlangıç zamanı")
-    end_time: str = Field(description="ISO-8601 bitiş zamanı")
-    service: str | None = Field(default=None, description="Servis adı filtresi (opsiyonel)")
-    error_code: str | None = Field(default=None, description="Hata kodu filtresi (opsiyonel)")
-    status: Literal["success", "failed"] | None = Field(default=None, description="İşlem durumu filtresi (opsiyonel)")
+BreakdownMetric = Literal["technical_rate", "decline_rate", "timeout_rate", "reversal_ratio", "response_code"]
+
+
+class BreakdownArgs(BaselineArgs):
+    dimension: Literal[tuple(DIMENSIONS)] = Field(description="Kırılım boyutu, ör. bank_id")  # type: ignore[valid-type]
+    metric: BreakdownMetric = Field(default="technical_rate", description="Karşılaştırılan metrik")
+    response_code: str | None = Field(default=None, pattern=r"^[0-9A-Z]{2,4}$", description="metric=response_code ise kod")
+
+
+class ResponseCodeArgs(BaselineArgs):
+    dimension: Literal[tuple(DIMENSIONS)] | None = Field(  # type: ignore[valid-type]
+        default=None, description="Olağandışı kodun segment kırılımı için boyut (opsiyonel)")
+
+
+class VersionArgs(WindowArgs):
+    service_name: Literal[tuple(SERVICES)] = Field(description="Sürümleri karşılaştırılacak servis")  # type: ignore[valid-type]
+
+
+class TransactionSearchArgs(WindowArgs):
+    transaction_status: Literal[tuple(TRANSACTION_STATUSES)] | None = None  # type: ignore[valid-type]
+    response_code: str | None = Field(default=None, pattern=r"^[0-9A-Z]{2,4}$")
     limit: int = Field(default=10, ge=1, le=50, description="Dönecek örnek kayıt sayısı (en fazla 50)")
-    cursor: int | None = Field(default=None, description="Sonraki sayfa için önceki yanıttaki next_cursor")
-
-
-class MetricsArgs(BaseModel):
-    start_time: str = Field(description="ISO-8601 başlangıç zamanı")
-    end_time: str = Field(description="ISO-8601 bitiş zamanı")
-    service: str | None = Field(default=None, description="Servis adı filtresi (opsiyonel)")
-
-
-class CompareArgs(_WindowPairArgs):
-    pass
-
-
-class PatternArgs(_WindowPairArgs):
-    pass
-
-
-class SimilarIncidentArgs(_WindowPairArgs):
-    pass
+    cursor: str | None = Field(default=None, max_length=200, description="Sonraki sayfa için önceki yanıttaki next_cursor")
 
 
 class RunbookArgs(BaseModel):
-    query: str = Field(description="Runbook araması, ör. 'PROVIDER_TIMEOUT provider-connector'")
+    query: str = Field(max_length=300, description="Runbook araması, ör. 'BANK_B timeout 68 POS'")
 
 
-class ReportArgs(BaseModel):
-    findings: list[str] = Field(description="Araç sonuçlarına dayanan kısa bulgu cümleleri")
+class FindingsArgs(BaseModel):
+    findings: list[str] = Field(description="Araç sonuçlarına dayanan 3-6 kısa Türkçe bulgu")
 
     @field_validator("findings", mode="before")
     @classmethod
@@ -87,86 +136,118 @@ class ReportArgs(BaseModel):
 # ---------- Araç çıktıları ----------
 
 
-class MetricsResult(BaseModel):
-    window_start: str
-    window_end: str
-    service: str | None = None
-    total_attempts: int
-    successful: int
-    failed: int
-    error_rate: float | None
-    avg_latency_ms: float | None
-    p95_latency_ms: float | None
-    sufficient_data: bool
+class _Out(BaseModel):
+    model_config = ConfigDict(extra="allow")
 
 
-class ComparisonResult(BaseModel):
-    current: MetricsResult
-    baseline: MetricsResult
-    error_rate_delta_pp: float | None
-    error_rate_ratio: float | None
-    p95_change_pct: float | None
-    avg_latency_change_pct: float | None
-    volume_per_min_current: float | None
-    volume_per_min_baseline: float | None
-    volume_change_pct: float | None
-    excess_failed: int
-
-
-class CodeItem(BaseModel):
-    key: str
-    count: int
-    share: float
-    baseline_count: int
-
-
-class Pattern(BaseModel):
-    type: str
+class Detection(_Out):
+    detector: str
     detected: bool
     subject: str | None
     metric: str
-    current: float | int | list | None
-    baseline: float | int | list | None
-    rule: str
-    sample_size: int
+    observed: float | int | None
+    baseline: float | int | None
+    abs_deviation: float | None
+    rel_deviation_pct: float | None
+    window: dict
+    baseline_window: dict | None
+    scope: dict
+    sample_size: dict
+    evidence_quality: Literal["sufficient", "limited", "insufficient"]
     insufficient_data: bool
     statistic: float | None
+    method: str
+    limitations: list[str]
+    claim_type: Literal["observation", "correlation", "hypothesis"]
     evidence: str
 
 
-class PatternResult(BaseModel):
-    window_start: str
-    window_end: str
-    baseline_start: str
-    baseline_end: str
-    service: str | None
-    total_failed: int
-    top_error_codes: list[CodeItem]
-    patterns: list[Pattern]
-    detected_types: list[str]
-    affected_services: list[str]
-    services: list[dict]
+class Stats(_Out):
+    total: int
+    approved: int
+    declined: int
+    technical: int
+    timeouts: int
+    reversals: int
+    p95_ms: float | None
+    technical_rate: float | None
+    decline_rate: float | None
+
+
+class CoverageResult(_Out):
+    window: dict
+    filters: dict
+    events: int
+    primary_transactions: int
+    coverage_ratio: float
+    d1_available: bool
+    null_rates: dict
+    evidence_quality: Literal["sufficient", "limited", "insufficient"]
+    issues: list[str]
+
+
+class MetricsResult(Stats):
+    window: dict
+    filters: dict
+
+
+class BaselineResult(_Out):
+    window: dict
+    baseline_window: dict
+    filters: dict
+    current: Stats
+    baseline: Stats
+    deltas: dict
+    excess: dict
+    detections: list[Detection]
+
+
+class BreakdownResult(_Out):
+    dimension: str
+    metric: str
+    segments: list[dict]
+    isolated: bool
+    isolated_segment: str | None
+    verdict: str
+    detection: Detection
+
+
+class ResponseCodeResult(_Out):
+    codes: list[dict]
+    detections: list[Detection]
+    isolation: dict | None
+
+
+class LatencyResult(_Out):
+    rho: float | None
+    lead_minutes: int | None
     buckets: list[dict]
-    onset_time: str | None
-    duration_min: int
-    ongoing: bool
-    onset_shape: str | None
-    anomalous_buckets: list[str]
-    threshold_note: str
+    detections: list[Detection]
 
 
-class LogSearchResult(BaseModel):
-    window_start: str
-    window_end: str
-    filters: dict[str, str | None]
+class ReversalResult(_Out):
+    current: dict
+    baseline: dict
+    detection: Detection
+    reconciliation_risk: dict
+
+
+class VersionResult(_Out):
+    service: str
+    versions: list[dict]
+    deployments: list[dict]
+    detection: Detection
+
+
+class TransactionSearchResult(_Out):
     total_matches: int
     returned: int
-    next_cursor: int | None
+    next_cursor: str | None
     samples: list[dict]
-    warnings: list[str] = []
+    warnings: list[str]
 
 
-class SimilarIncidentResult(BaseModel):
+class SimilarIncidentResult(_Out):
     signature: dict
     matches: list[dict]
     found: bool
@@ -174,7 +255,7 @@ class SimilarIncidentResult(BaseModel):
     disclaimer: str
 
 
-class RunbookHit(BaseModel):
+class RunbookHit(_Out):
     source: str
     section: str
     text: str
@@ -182,7 +263,7 @@ class RunbookHit(BaseModel):
     flagged: bool = False
 
 
-class RunbookSearchResult(BaseModel):
+class RunbookSearchResult(_Out):
     query: str
     found: bool
     hits: list[RunbookHit]
@@ -190,28 +271,32 @@ class RunbookSearchResult(BaseModel):
     message: str
 
 
-class ReportToolResult(BaseModel):
+class FindingsResult(_Out):
     accepted_findings: list[str]
-    rejected_findings: list[str]
 
 
 TOOL_OUTPUT_SCHEMAS: dict[str, type[BaseModel]] = {
-    "search_payment_logs": LogSearchResult,
-    "calculate_payment_metrics": MetricsResult,
-    "compare_time_windows": ComparisonResult,
-    "analyze_error_patterns": PatternResult,
+    "check_data_coverage": CoverageResult,
+    "get_payment_metrics": MetricsResult,
+    "compare_with_baseline": BaselineResult,
+    "breakdown_by_dimension": BreakdownResult,
+    "analyze_response_codes": ResponseCodeResult,
+    "analyze_latency_timeouts": LatencyResult,
+    "analyze_reversals": ReversalResult,
+    "compare_service_versions": VersionResult,
+    "search_transactions": TransactionSearchResult,
     "search_similar_incidents": SimilarIncidentResult,
     "search_runbooks": RunbookSearchResult,
-    "generate_incident_report": ReportToolResult,
+    "submit_findings": FindingsResult,
 }
 
 # ---------- Risk ve rapor ----------
 
-RiskLevel = Literal["LOW", "MEDIUM", "HIGH", "INDETERMINATE"]
+Severity = Literal["LOW", "MEDIUM", "HIGH", "INDETERMINATE"]
 ConfidenceLevel = Literal["LOW", "MEDIUM", "HIGH"]
 
 
-class RiskReason(BaseModel):
+class RiskFactor(BaseModel):
     factor: str
     value: str
     points: int
@@ -219,24 +304,31 @@ class RiskReason(BaseModel):
 
 
 class RiskAssessment(BaseModel):
-    level: RiskLevel
+    severity: Severity
     score: int | None
-    reasons: list[RiskReason]
+    factors: list[RiskFactor]
+    affected_scope: dict
+    affected_transactions: int
+    monetary_impact: str
+    evidence_quality: str
+    evidence_limitations: list[str]
     confidence: ConfidenceLevel
     confidence_reasons: list[str]
+    capped: str | None = None
+    formula: str
     note: str
 
 
-class Observation(BaseModel):
+class Fact(BaseModel):
     id: str
     text: str
-    evidence: str
+    source: str  # "adım N: araç" biçiminde
 
 
-class Explanation(BaseModel):
+class Hypothesis(BaseModel):
     text: str
     evidence_refs: list[str]
-    confidence: Literal["low", "medium"]
+    status: Literal["doğrulanmadı"] = "doğrulanmadı"
 
 
 class Recommendation(BaseModel):
@@ -245,38 +337,40 @@ class Recommendation(BaseModel):
     evidence_refs: list[str] = []
 
 
-class Deviation(BaseModel):
-    metric: str
-    current: str
-    baseline: str
-    change: str
-
-
-class IncidentReport(BaseModel):
+class InvestigationReport(BaseModel):
     title: str
     generated_at: str
+    question: str
+    status: Literal["complete", "incomplete", "insufficient_evidence"]
     mode: str
     data_source: str
+    data_label: str
     scope: dict
     data_coverage: dict
     assumptions: list[str]
-    risk: RiskAssessment
-    current: MetricsResult | None
-    baseline: MetricsResult | None
-    comparison: ComparisonResult | None
-    detected_patterns: list[Pattern]
-    evaluated_patterns: list[Pattern]
-    deviations: list[Deviation]
-    affected_services: list[dict]
-    affected_error_codes: list[CodeItem]
+    executive_summary: list[str]
+    key_metrics: list[dict]
+    detections: list[Detection]
+    evaluated: list[Detection]
+    affected_scope: list[dict]
+    response_codes: list[dict]
+    latency_findings: list[str]
+    reversal_findings: list[str]
+    version_findings: list[str]
     similar_incidents: list[dict]
     similar_incidents_note: str
-    observations: list[Observation]
-    possible_explanations: list[Explanation]
-    confirmed_root_cause: str | None
-    recommended_steps: list[Recommendation]
-    agent_findings: list[str]
     runbook_sources: list[str]
+    risk: RiskAssessment
+    recommendations: list[Recommendation]
+    facts: list[Fact]
+    hypotheses: list[Hypothesis]
+    confirmed_causes: list[str]
+    agent_findings: list[str]
     limitations: list[str]
+    tool_steps: list[dict]
     validation: list[dict]
     disclaimer: str
+    # Yalnızca çoklu agent modunda doldurulur
+    agent_runs: list[dict] = []
+    conflicts: list[dict] = []
+    orchestration: dict = {}

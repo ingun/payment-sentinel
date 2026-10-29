@@ -2,6 +2,7 @@
 .env
 .env.*
 !.env.example
+.streamlit/secrets.toml
 
 # Python
 .venv/
@@ -9,8 +10,11 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .ruff_cache/
+.coverage
+htmlcov/
 
-# Benchmark ara çıktıları
+# Üretilen sentetik veri (python -m src.data_generator --export) ve benchmark ara çıktıları
+data/generated/
 benchmarks/*.tmp
 
 # Yerel agent/araç dosyaları (.venv'e işaret eden linkler)

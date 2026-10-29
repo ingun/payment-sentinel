@@ -2,30 +2,33 @@
 Çalışan uygulamadan ekran görüntüsü alır (Playwright + sistemde kurulu Microsoft Edge).
 
 Önce uygulamayı başlatın:  streamlit run app.py --server.headless true
-Sonra:                     python -m scripts.screenshots
+Sonra:                     python -m scripts.screenshots [--llm]
 Geliştirme bağımlılığı:    pip install -r requirements-dev.txt
 """
 
+import os
 import sys
 
 from playwright.sync_api import Page, sync_playwright
 
 from src.config import ROOT_DIR
 
-BASE = "http://localhost:8501"
+BASE = os.getenv("SCREENSHOT_BASE_URL", "http://localhost:8501")
 OUT = ROOT_DIR / "screenshots"
 RUN_TIMEOUT_MS = 300_000
+START_BUTTON = "İncelemeyi başlat"
 
 
 def investigate(page: Page, query: str, request: str | None = None) -> None:
     page.goto(f"{BASE}/?{query}")
-    page.get_by_role("button", name="Investigate Incident").wait_for(timeout=60_000)
+    page.get_by_role("button", name=START_BUTTON).wait_for(timeout=60_000)
     if request:
         box = page.get_by_label("İnceleme talebi")
         box.fill(request)
         box.press("Control+Enter")
-    page.get_by_role("button", name="Investigate Incident").click()
-    page.get_by_text("Risk:", exact=False).first.wait_for(timeout=RUN_TIMEOUT_MS)
+        page.wait_for_timeout(800)
+    page.get_by_role("button", name=START_BUTTON).click()
+    page.get_by_text("İnceleme tamamlandı").wait_for(timeout=RUN_TIMEOUT_MS)
     page.wait_for_timeout(1500)
 
 
@@ -40,73 +43,71 @@ def shot(page: Page, name: str) -> None:
     print(f"kaydedildi: {path.name}", flush=True)
 
 
-def section(page: Page, text: str, name: str) -> None:
-    """Streamlit içeriği kendi kapsayıcısında kaydığı için full_page alt bölümlere inmez; bölüme kaydırıp çeker."""
-    page.get_by_text(text, exact=False).first.scroll_into_view_if_needed()
-    page.wait_for_timeout(800)
-    path = OUT / f"{name}.png"
-    page.screenshot(path=str(path))
-    print(f"kaydedildi: {path.name}", flush=True)
-
-
 def main(include_llm: bool) -> None:
     OUT.mkdir(exist_ok=True)
     with sync_playwright() as p:
         browser = p.chromium.launch(channel="msedge", headless=True)
-        page = browser.new_page(viewport={"width": 1440, "height": 2400})
+        page = browser.new_page(viewport={"width": 1440, "height": 2200})
 
         if include_llm:
-            investigate(page, "scenario=error_spike&provider=ollama")
-            shot(page, "01_llm_error_spike_overview")
-            tab(page, "🔎 Agent izleri")
-            shot(page, "02_llm_agent_trace")
-            tab(page, "📄 Rapor")
-            shot(page, "03_llm_incident_report")
-            section(page, "Agent bulgu özeti", "03b_llm_agent_findings")
+            investigate(page, "scenario=bank_timeout&provider=ollama")
+            tab(page, "Agent'lar")
+            shot(page, "00_llm_multi_agent")
+            investigate(page, "scenario=bank_timeout&provider=ollama&arch=single")
+            tab(page, "İşlem izleri")
+            shot(page, "00b_llm_single_agent_trace")
+            tab(page, "Gerçekler ve hipotezler")
+            shot(page, "00c_llm_findings")
 
-        investigate(page, "scenario=error_spike&provider=none")
-        tab(page, "📈 Zaman serisi")
-        shot(page, "04_error_spike_timeseries")
-        tab(page, "🧩 Paternler")
-        shot(page, "05_error_spike_patterns")
-        tab(page, "🕘 Benzer olaylar")
-        shot(page, "06_error_spike_similar_incidents")
-        tab(page, "📚 Runbook kaynakları")
-        shot(page, "07_error_spike_runbooks")
+        # Çoklu agent (varsayılan mimari)
+        investigate(page, "scenario=bank_timeout&provider=none")
+        shot(page, "01_bank_timeout_overview")
+        tab(page, "Agent'lar")
+        shot(page, "14_multi_agent_parallel")
+        tab(page, "İşlem izleri")
+        shot(page, "02_bank_timeout_trace")
+        tab(page, "Segmentler")
+        shot(page, "03_bank_timeout_segments")
+        tab(page, "Gerçekler ve hipotezler")
+        shot(page, "04_facts_vs_hypotheses")
+        tab(page, "Benzer olaylar")
+        shot(page, "05_similar_incidents")
+        tab(page, "Runbook'lar")
+        shot(page, "06_runbooks")
 
-        investigate(page, "scenario=latency_degradation&provider=none")
-        shot(page, "08_latency_degradation_overview")
-        tab(page, "⚠️ Hatalar ve servisler")
-        shot(page, "09_latency_services")
+        investigate(page, "scenario=latency_then_failures&provider=none")
+        tab(page, "Gecikme ve timeout")
+        shot(page, "07_latency_then_failures")
 
-        investigate(page, "scenario=volume_drop&provider=none")
-        tab(page, "📈 Zaman serisi")
-        shot(page, "10_volume_drop_timeseries")
+        investigate(page, "scenario=version_regression&provider=none")
+        tab(page, "Sürümler")
+        shot(page, "08_version_regression")
 
-        investigate(page, "scenario=normal&provider=none")
-        shot(page, "11_normal_no_false_alarm")
+        investigate(page, "scenario=reversal_anomaly&provider=none")
+        tab(page, "Reversal")
+        shot(page, "09_reversal_anomaly")
+        tab(page, "Agent'lar")
+        shot(page, "15_multi_agent_follow_up")
 
-        investigate(page, "scenario=error_spike&provider=none&fault=runbook_error")
-        tab(page, "🔎 Agent izleri")
-        shot(page, "12_tool_failure_handling")
+        # Tek agent (LangGraph) mimarisi
+        investigate(page, "scenario=bank_timeout&provider=none&arch=single")
+        tab(page, "İşlem izleri")
+        shot(page, "16_single_agent_trace")
 
-        investigate(page, "scenario=latency_degradation&provider=none", "Son 45 dakikadaki ödeme hatalarını araştır")
-        investigate_follow_up(page)
-        tab(page, "🧠 Hafıza")
-        shot(page, "13_follow_up_memory")
+        investigate(page, "scenario=low_volume&provider=none")
+        shot(page, "10_low_volume_insufficient")
+
+        investigate(page, "scenario=normal_fluctuation&provider=none")
+        shot(page, "11_normal_fluctuation_no_alarm")
+
+        investigate(page, "scenario=bank_timeout&provider=none&fault=runbook_error")
+        tab(page, "İşlem izleri")
+        shot(page, "12_tool_failure_incomplete")
+
+        tab(page, "Risk")
+        shot(page, "13_risk_explanation")
         browser.close()
 
 
-def investigate_follow_up(page: Page) -> None:
-    """Aynı oturumda takip sorusu (sayfa yenilenmez; hafıza korunur)."""
-    box = page.get_by_label("İnceleme talebi")
-    box.fill("Şimdi sadece acquirer-gateway servisine bak")
-    box.press("Control+Enter")
-    page.wait_for_timeout(800)
-    page.get_by_role("button", name="Investigate Incident").click()
-    page.get_by_text("İnceleme tamamlandı").wait_for(timeout=RUN_TIMEOUT_MS)
-    page.wait_for_timeout(1500)
-
-
 if __name__ == "__main__":
-    main(include_llm="--no-llm" not in sys.argv)
+    main(include_llm="--llm" in sys.argv)

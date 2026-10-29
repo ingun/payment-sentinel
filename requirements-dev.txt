@@ -1,3 +1,6 @@
-# Yalnızca ekran görüntüsü betiği için (scripts/screenshots.py); sistemde Microsoft Edge kullanır
+# Geliştirme bağımlılıkları
 -r requirements.txt
+# Ekran görüntüsü betiği (scripts/screenshots.py); sistemde Microsoft Edge kullanır
 playwright==1.64.1
+# Test kapsamı: python -m pytest --cov=src --cov-branch
+pytest-cov==7.0.0
